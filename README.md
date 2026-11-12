@@ -13,4 +13,5 @@ docs/     notes and templates
 ## Author
 Umme Salma
 
-##testing git pull
+## testing gitpull
+Created this README to practice git push and pull
