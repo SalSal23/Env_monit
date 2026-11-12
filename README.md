@@ -14,5 +14,5 @@ docs/     notes and templates
 Umme Salma
 
 ## testing gitpull
-Created this README to practice git push and pull
+Created this README to practice git push and pull/
 Umme salma 12-11-2026
