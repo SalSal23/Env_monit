@@ -1,0 +1,509 @@
+---
+title: "Data summary of my five flux towers"
+author: "Umme Salma"
+date: "19-12-2026"
+format:
+  html:
+    toc: true
+    embed-resources: true
+execute:
+  warning: false
+---
+
+# C1. Site overview
+
+```{python}
+import json
+import zipfile
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from IPython.display import display
+
+
+def find_project_root():
+    for candidate in (Path.cwd(), *Path.cwd().parents):
+        if (candidate / "data" / "raw").is_dir() and (
+            candidate / "flux4student" / "sites.json"
+        ).is_file():
+            return candidate
+    raise FileNotFoundError(
+        "Could not locate the project root containing data/raw and flux4student/sites.json."
+    )
+
+
+project_root = find_project_root()
+raw_dir = project_root / "data" / "raw"
+zip_files = sorted(raw_dir.glob("*_FLUXNET_*.zip"))
+if len(zip_files) != 5:
+    raise ValueError(f"Expected five FLUXNET zip files in {raw_dir}; found {len(zip_files)}.")
+
+keep = [
+    "TIMESTAMP_START", "TIMESTAMP_END", "TA_F", "SW_IN_F", "VPD_F", "P_F",
+    "NETRAD", "G_F_MDS", "H_F_MDS", "H_F_MDS_QC", "LE_F_MDS", "LE_F_MDS_QC",
+    "NEE_VUT_REF", "NEE_VUT_REF_QC", "GPP_NT_VUT_REF", "RECO_NT_VUT_REF",
+]
+
+
+def read_hh(zip_file):
+    zip_file = Path(zip_file)
+    with zipfile.ZipFile(zip_file) as archive:
+        members = [name for name in archive.namelist() if "FLUXMET_HH" in name]
+        if not members:
+            raise ValueError(f"No FLUXMET_HH file found in {zip_file.name}.")
+        with archive.open(members[0]) as csv_file:
+            hh = pd.read_csv(
+                csv_file,
+                na_values=[-9999],
+                usecols=lambda column: column in keep,
+                dtype={"TIMESTAMP_START": str, "TIMESTAMP_END": str},
+            )
+
+    hh["time"] = pd.to_datetime(hh["TIMESTAMP_START"], format="%Y%m%d%H%M")
+    hh["site"] = zip_file.stem.split("_", maxsplit=2)[1]
+    return hh
+
+
+hh_all = pd.concat([read_hh(zip_file) for zip_file in zip_files], ignore_index=True)
+sites = sorted(hh_all["site"].unique())
+if len(sites) != 5:
+    raise ValueError(f"Expected five distinct tower sites; found {sites}.")
+
+registry = json.loads(
+    (project_root / "flux4student" / "sites.json").read_text(encoding="utf-8")
+)
+registry_by_site = {row["id"]: row for row in registry}
+missing_metadata = sorted(set(sites) - set(registry_by_site))
+if missing_metadata:
+    raise ValueError(f"Missing site metadata for: {', '.join(missing_metadata)}.")
+
+country_names = {
+    "AU": "Australia",
+    "CN": "China",
+    "CZ": "Czech Republic",
+    "IT": "Italy",
+    "US": "United States",
+}
+meta = pd.DataFrame(
+    [
+        {
+            "SITE_ID": site,
+            "SITE_NAME": registry_by_site[site]["name"],
+            "COUNTRY": country_names.get(site[:2], site[:2]),
+            "IGBP": registry_by_site[site]["igbp"],
+            "LAT": registry_by_site[site]["lat"],
+            "LON": registry_by_site[site]["lon"],
+            "FIRST_YEAR": registry_by_site[site]["first"],
+            "LAST_YEAR": registry_by_site[site]["last"],
+            "HUB": registry_by_site[site]["hub"],
+            "CITATION": registry_by_site[site]["cite"],
+        }
+        for site in sites
+    ]
+)
+
+display(meta)
+```
+
+The site information comes from the tracked `flux4student/sites.json` registry,
+so the report does not depend on a separate `data/site_snapshot.csv` file.
+
+```{python}
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.scatter(meta["LON"], meta["LAT"])
+
+for _, row in meta.iterrows():
+    ax.text(row["LON"], row["LAT"], row["SITE_ID"], fontsize=9)
+
+ax.set_xlabel("Longitude (degrees)")
+ax.set_ylabel("Latitude (degrees)")
+ax.set_title("Locations of the five flux towers")
+ax.set_xlim(-180, 180)
+ax.set_ylim(-60, 85)
+ax.grid(True, alpha=0.3)
+fig.tight_layout()
+plt.show()
+```
+
+# C2. Data coverage
+
+Measured coverage is the share of half-hours where `NEE_VUT_REF_QC` equals zero.
+
+```{python}
+hh_all["year"] = hh_all["time"].dt.year
+coverage = (
+    hh_all.assign(measured=hh_all["NEE_VUT_REF_QC"].eq(0))
+    .groupby(["site", "year"])["measured"]
+    .mean()
+    .unstack("year")
+    .reindex(sites)
+)
+
+fig, ax = plt.subplots(figsize=(11, 4))
+image = ax.imshow(
+    coverage.to_numpy(),
+    aspect="auto",
+    interpolation="nearest",
+    vmin=0,
+    vmax=1,
+    cmap="viridis",
+)
+ax.set_yticks(np.arange(len(coverage.index)), labels=coverage.index)
+ax.set_xticks(
+    np.arange(len(coverage.columns)),
+    labels=coverage.columns.astype(int),
+    rotation=45,
+)
+ax.set_xlabel("Year")
+ax.set_ylabel("Site")
+ax.set_title("Share of half-hours with measured NEE (QC = 0)")
+colorbar = fig.colorbar(image, ax=ax)
+colorbar.set_label("Measured share")
+fig.tight_layout()
+plt.show()
+
+mean_coverage = coverage.mean(axis=1).sort_values(ascending=False)
+best_site = mean_coverage.index[0]
+best_years = coverage.loc[best_site].dropna().sort_values(ascending=False).head(3)
+year_summary = ", ".join(
+    f"{int(year)} ({share:.1%})" for year, share in best_years.items()
+)
+print(
+    f"{best_site} has the highest average measured share across its years "
+    f"({mean_coverage.iloc[0]:.1%}); its three best years are {year_summary}."
+)
+```
+
+# C3. Summary statistics
+
+The statistics below use half-hourly values, except for `P_F`: precipitation is
+summed by calendar year, then its mean, minimum and maximum annual totals are
+reported. Missingness is the share of half-hours without a value. Units are
+included in each variable label.
+
+```{python}
+variable_units = {
+    "TA_F": "deg C",
+    "SW_IN_F": "W m-2",
+    "VPD_F": "hPa",
+    "P_F": "mm/year (annual sums)",
+    "NEE_VUT_REF": "umol CO2 m-2 s-1",
+    "GPP_NT_VUT_REF": "umol CO2 m-2 s-1",
+    "RECO_NT_VUT_REF": "umol CO2 m-2 s-1",
+    "H_F_MDS": "W m-2",
+    "LE_F_MDS": "W m-2",
+}
+
+for variable, unit in variable_units.items():
+    rows = []
+    for site, group in hh_all.groupby("site", sort=True):
+        values = group[variable]
+        if variable == "P_F":
+            annual_values = (
+                pd.DataFrame({"year": group["time"].dt.year, "value": values})
+                .groupby("year")["value"]
+                .sum(min_count=1)
+            )
+            mean_value = annual_values.mean()
+            min_value = annual_values.min()
+            max_value = annual_values.max()
+            statistic = f"annual total ({unit})"
+        else:
+            mean_value = values.mean()
+            min_value = values.min()
+            max_value = values.max()
+            statistic = f"value ({unit})"
+
+        rows.append(
+            {
+                "Site": site,
+                f"Mean {statistic}": mean_value,
+                f"Minimum {statistic}": min_value,
+                f"Maximum {statistic}": max_value,
+                "Missing (%)": values.isna().mean() * 100,
+            }
+        )
+
+    print(variable)
+    display(pd.DataFrame(rows).round(2))
+```
+
+# C4. Daily time series
+
+Daily values are the arithmetic means of the half-hourly fluxes. The conversion
+is `1 umol CO2 m-2 s-1 = 1.0378 g C m-2 d-1`; negative NEE values are retained.
+
+```{python}
+carbon_fluxes = ["NEE_VUT_REF", "GPP_NT_VUT_REF", "RECO_NT_VUT_REF"]
+daily = (
+    hh_all.set_index("time")
+    .groupby("site")[carbon_fluxes]
+    .resample("D")
+    .mean()
+    .reset_index()
+)
+daily_gC = daily.copy()
+daily_gC[carbon_fluxes] = daily_gC[carbon_fluxes] * 1.0378
+
+fig, axes = plt.subplots(len(sites), 1, figsize=(13, 2.8 * len(sites)), sharex=True)
+for ax, site in zip(axes, sites):
+    site_daily = daily_gC.loc[daily_gC["site"] == site]
+    for variable, label in [
+        ("NEE_VUT_REF", "NEE"),
+        ("GPP_NT_VUT_REF", "GPP"),
+        ("RECO_NT_VUT_REF", "RECO"),
+    ]:
+        ax.plot(site_daily["time"], site_daily[variable], linewidth=0.55, label=label)
+    ax.axhline(0, color="0.5", linewidth=0.6)
+    ax.set_ylabel("g C m-2 d-1")
+    ax.set_title(site, loc="left")
+    ax.legend(ncol=3, fontsize=8)
+
+axes[-1].set_xlabel("Date (local standard time)")
+fig.suptitle("Daily NEE, GPP and RECO", y=1.002)
+fig.tight_layout()
+plt.show()
+```
+
+The half-hourly daily NEE mean is compared with the daily `FLUXMET_DD` NEE
+product for one site as an aggregation check.
+
+```{python}
+check_site = sites[0]
+check_zip = next(
+    path for path in zip_files
+    if path.stem.split("_", maxsplit=2)[1] == check_site
+)
+with zipfile.ZipFile(check_zip) as archive:
+    daily_members = [name for name in archive.namelist() if "FLUXMET_DD" in name]
+    if not daily_members:
+        raise ValueError(f"No FLUXMET_DD file found in {check_zip.name}.")
+    with archive.open(daily_members[0]) as csv_file:
+        daily_product = pd.read_csv(
+            csv_file,
+            usecols=lambda column: column in {"TIMESTAMP", "NEE_VUT_REF"},
+            dtype={"TIMESTAMP": str},
+            na_values=[-9999],
+        )
+
+if "TIMESTAMP" not in daily_product or "NEE_VUT_REF" not in daily_product:
+    raise ValueError("The daily product must contain TIMESTAMP and NEE_VUT_REF columns.")
+
+daily_product["date"] = pd.to_datetime(
+    daily_product["TIMESTAMP"], format="%Y%m%d", errors="coerce"
+)
+daily_product = daily_product.set_index("date")["NEE_VUT_REF"].rename("FLUXMET_DD")
+half_hourly_daily = (
+    hh_all.loc[hh_all["site"] == check_site]
+    .assign(date=lambda frame: frame["time"].dt.normalize())
+    .groupby("date")["NEE_VUT_REF"]
+    .mean()
+    .rename("Half-hourly daily mean")
+)
+daily_comparison = pd.concat([half_hourly_daily, daily_product], axis=1).dropna()
+if daily_comparison.empty:
+    raise ValueError("No matching dates found for the daily aggregation check.")
+
+mae = (
+    daily_comparison["Half-hourly daily mean"] - daily_comparison["FLUXMET_DD"]
+).abs().mean()
+print(
+    f"{check_site}: compared {len(daily_comparison):,} days; "
+    f"mean absolute difference = {mae:.3f} umol CO2 m-2 s-1."
+)
+```
+
+# C5. Diurnal cycles
+
+Seasons are assigned from each site's latitude. Northern-hemisphere seasons are
+DJF (winter), MAM (spring), JJA (summer) and SON (autumn); the season mapping is
+reversed for southern-hemisphere sites. Time of day is local standard time.
+
+```{python}
+north_season = {
+    12: "Winter", 1: "Winter", 2: "Winter",
+    3: "Spring", 4: "Spring", 5: "Spring",
+    6: "Summer", 7: "Summer", 8: "Summer",
+    9: "Autumn", 10: "Autumn", 11: "Autumn",
+}
+south_season = {
+    6: "Winter", 7: "Winter", 8: "Winter",
+    9: "Spring", 10: "Spring", 11: "Spring",
+    12: "Summer", 1: "Summer", 2: "Summer",
+    3: "Autumn", 4: "Autumn", 5: "Autumn",
+}
+season_colors = {
+    "Winter": "tab:blue",
+    "Spring": "tab:green",
+    "Summer": "tab:red",
+    "Autumn": "tab:orange",
+}
+latitude_by_site = meta.set_index("SITE_ID")["LAT"]
+diurnal_parts = []
+
+for site, group in hh_all.groupby("site", sort=True):
+    part = group[["time", "NEE_VUT_REF", "LE_F_MDS"]].copy()
+    season_lookup = north_season if latitude_by_site[site] >= 0 else south_season
+    part["season"] = part["time"].dt.month.map(season_lookup)
+    part["hour"] = part["time"].dt.hour + part["time"].dt.minute / 60
+    part["site"] = site
+    diurnal_parts.append(part)
+
+diurnal = pd.concat(diurnal_parts, ignore_index=True)
+diurnal_means = (
+    diurnal.groupby(["site", "season", "hour"])[["NEE_VUT_REF", "LE_F_MDS"]]
+    .mean()
+    .reset_index()
+)
+
+fig, axes = plt.subplots(len(sites), 2, figsize=(12, 3 * len(sites)), sharex=True)
+for row, site in enumerate(sites):
+    site_means = diurnal_means.loc[diurnal_means["site"] == site]
+    for column, (variable, ylabel) in enumerate(
+        [
+            ("NEE_VUT_REF", "NEE (umol CO2 m-2 s-1)"),
+            ("LE_F_MDS", "LE (W m-2)"),
+        ]
+    ):
+        ax = axes[row, column]
+        for season in ["Winter", "Spring", "Summer", "Autumn"]:
+            curve = site_means.loc[site_means["season"] == season]
+            if not curve.empty:
+                ax.plot(
+                    curve["hour"],
+                    curve[variable],
+                    color=season_colors[season],
+                    label=season,
+                )
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{site}: {variable}", loc="left")
+        ax.set_xticks(np.arange(0, 24, 4))
+        if row == 0:
+            ax.legend(ncol=4, fontsize=8)
+
+axes[-1, 0].set_xlabel("Hour of day (local standard time)")
+axes[-1, 1].set_xlabel("Hour of day (local standard time)")
+fig.suptitle("Seasonal mean diurnal cycles", y=1.002)
+fig.tight_layout()
+plt.show()
+```
+
+# C6. Your reading
+
+## Energy balance
+
+The tower with the most valid observations is selected. Only half-hours with
+measured sensible and latent heat (`H_F_MDS_QC == 0` and `LE_F_MDS_QC == 0`)
+and non-missing values for all four plotted fluxes are used.
+
+```{python}
+energy_counts = {}
+for site, group in hh_all.groupby("site"):
+    measured = (
+        group["H_F_MDS_QC"].eq(0)
+        & group["LE_F_MDS_QC"].eq(0)
+        & group[["H_F_MDS", "LE_F_MDS", "NETRAD", "G_F_MDS"]].notna().all(axis=1)
+    )
+    energy_counts[site] = int(measured.sum())
+
+energy_site = max(energy_counts, key=energy_counts.get)
+if energy_counts[energy_site] < 2:
+    raise ValueError("No site has enough measured half-hours for an energy-balance fit.")
+
+energy_data = hh_all.loc[hh_all["site"] == energy_site]
+measured = (
+    energy_data["H_F_MDS_QC"].eq(0)
+    & energy_data["LE_F_MDS_QC"].eq(0)
+    & energy_data[["H_F_MDS", "LE_F_MDS", "NETRAD", "G_F_MDS"]].notna().all(axis=1)
+)
+energy_data = energy_data.loc[measured]
+x = (energy_data["NETRAD"] - energy_data["G_F_MDS"]).to_numpy()
+y = (energy_data["H_F_MDS"] + energy_data["LE_F_MDS"]).to_numpy()
+slope, intercept = np.polyfit(x, y, 1)
+
+plot_indices = np.linspace(0, len(x) - 1, min(len(x), 20000), dtype=int)
+line_min = min(float(x.min()), float(y.min()))
+line_max = max(float(x.max()), float(y.max()))
+line = np.linspace(line_min, line_max, 100)
+
+fig, ax = plt.subplots(figsize=(7, 6))
+ax.scatter(x[plot_indices], y[plot_indices], s=5, alpha=0.18, rasterized=True)
+ax.plot(line, line, color="black", linestyle="--", label="1:1 line")
+ax.plot(
+    line,
+    slope * line + intercept,
+    color="crimson",
+    label=f"Linear fit (slope = {slope:.2f})",
+)
+ax.set_xlabel("NETRAD - G_F_MDS (W m-2)")
+ax.set_ylabel("H_F_MDS + LE_F_MDS (W m-2)")
+ax.set_title(f"Energy balance: {energy_site} (n = {len(x):,})")
+ax.legend()
+fig.tight_layout()
+plt.show()
+print(f"Linear-fit slope for {energy_site}: {slope:.3f}.")
+```
+
+## Data and citation
+
+The site product citations are taken from the most recent FLUXNET Shuttle
+snapshot in `data/snapshots` when available. If a snapshot is not present, the
+report uses `data/raw/CITATIONS.txt`, then the tracked site registry.
+
+```{python}
+from IPython.display import Markdown
+
+snapshot_files = sorted(
+    (project_root / "data" / "snapshots").glob("fluxnet_shuttle_snapshot_*.csv"),
+    reverse=True,
+)
+citation_by_site = {}
+citation_source = None
+
+if snapshot_files:
+    snapshot = pd.read_csv(snapshot_files[0], dtype={"site_id": str})
+    required_columns = {"site_id", "product_citation"}
+    if not required_columns.issubset(snapshot.columns):
+        raise ValueError(
+            f"{snapshot_files[0].name} must contain site_id and product_citation columns."
+        )
+    citation_by_site = (
+        snapshot.dropna(subset=["product_citation"])
+        .set_index("site_id")["product_citation"]
+        .to_dict()
+    )
+    citation_source = snapshot_files[0].name
+
+if not all(site in citation_by_site for site in sites):
+    citation_file = raw_dir / "CITATIONS.txt"
+    if citation_file.is_file():
+        for line in citation_file.read_text(encoding="utf-8").splitlines():
+            if ": " in line:
+                site, citation = line.split(": ", maxsplit=1)
+                if site in sites and citation.strip():
+                    citation_by_site.setdefault(site, citation.strip())
+
+for site in sites:
+    citation_by_site.setdefault(site, registry_by_site[site]["cite"])
+
+display(
+    Markdown(
+        f"Site product citations (snapshot: `{citation_source}`):\n\n"
+        + "\n".join(
+            f"- **{site}**: {citation_by_site[site]}" for site in sites
+        )
+    )
+)
+```
+
+Pastorello et al. (2020). The FLUXNET2015 dataset and the ONEFlux processing
+pipeline for eddy covariance data. *Scientific Data* 7, 225.
+[https://doi.org/10.1038/s41597-020-0534-3](https://doi.org/10.1038/s41597-020-0534-3)
+
+> FLUXNET data products were produced and harmonized by eddy covariance regional
+> networks and data processing centers, including AmeriFlux, ChinaFlux, European
+> Fluxes Database, ICOS, JapanFlux, KoFlux, OzFlux, SAEON, and TERN. These products
+> also include a modified version of ERA5 hourly data provided by the Copernicus
+> Climate Change Service.
